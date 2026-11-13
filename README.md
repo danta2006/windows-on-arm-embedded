@@ -92,6 +92,12 @@ pl2303: disagrees about version of symbol module_layout
 
 **所以只能整颗内核重编**，把 PL2303 编进去。
 
+> ⚠️ **重要警告（2026-11-13 实测）**
+> 换自定义内核后，`/lib/modules` 里的**发行版模块会全部不可用**，其中就包括 `usbipd` 依赖的 `vhci_hcd`。
+> 结果是 `usbipd attach` 直接报 `Loading vhci_hcd failed`，**整条 USB 透传链路会断掉**。
+> 只把串口驱动编进内核是不够的。要真正可用，必须连同**完整模块树**一起编译并安装
+> （`make modules` + `make modules_install` + `depmod`），再换内核。
+> 本仓库的脚本目前**只做了内核**，还没做模块，属于未完成状态——请谨慎使用。
 ## 第四步：重编内核（本仓库的脚本）
 
 ```bash
