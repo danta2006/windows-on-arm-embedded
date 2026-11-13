@@ -92,25 +92,24 @@ pl2303: disagrees about version of symbol module_layout
 
 **所以只能整颗内核重编**，把 PL2303 编进去。
 
-> ⚠️ **重要警告（2026-11-13 实测）**
-> 换自定义内核后，`/lib/modules` 里的**发行版模块会全部不可用**，其中就包括 `usbipd` 依赖的 `vhci_hcd`。
-> 结果是 `usbipd attach` 直接报 `Loading vhci_hcd failed`，**整条 USB 透传链路会断掉**。
-> 只把串口驱动编进内核是不够的。要真正可用，必须连同**完整模块树**一起编译并安装
-> （`make modules` + `make modules_install` + `depmod`），再换内核。
-> 本仓库的脚本目前**只做了内核**，还没做模块，属于未完成状态——请谨慎使用。
 ## 第四步：重编内核（本仓库的脚本）
 
+**先说结论：不能只编内核，必须连模块一起编、一起装。** 这是踩坑换来的（见后面的"三个坑"）。
+
+### 4.1 编译
+
 ```bash
-bash build-kernel.sh          # 约 30~35 分钟，全程本机原生编译
+bash build-kernel.sh          # 约 50 分钟：Image + 全部 4000 多个模块
 ```
 
 它做的事：
-1. 按 `uname -r` 推出精确的源码 tag（`linux-msft-wsl-6.18.58.1`）并克隆；
-2. **用当前运行内核的 `/proc/config.gz` 当基线**，只改配置里的串口驱动那几行；
-3. `make -j$(nproc) Image`；
-4. 产物放到 `~/wsl-kernel-out/`。
 
-因为基线就是官方配置，新内核和微软原版**只差这几行**，版本号、WSL 集成（9p / vsock / Hyper-V / dxg）全不变。
+1. 按 `uname -r` 推出精确的源码 tag（`linux-msft-wsl-6.18.58.1`）并克隆；
+2. **用当前运行内核的 `/proc/config.gz` 当基线**，只把 PL2303 打开（`=m`）；
+3. 把 `.git` 移开——否则版本号会多一个 `+`，和 `/lib/modules/` 对不上；
+4. `make -j$(nproc) Image modules`。
+
+### 4.2 换内核
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1
@@ -119,34 +118,50 @@ wsl --shutdown
 
 `install.ps1` 会把镜像复制到 `%USERPROFILE%\wsl-kernel\`、备份 `.wslconfig`、在 `[wsl2]` 段写入 `kernel=...`。
 
-重新进 WSL 后：
+### 4.3 装模块（**关键，千万别漏**）
+
+```bash
+bash install-modules.sh
+```
+
+**为什么不能漏**：换了内核以后，WSL 不再挂载官方那套模块，`/lib/modules/<版本>/` 是空的。
+而 `usbipd` 依赖的 `vhci_hcd` **就是一个模块**——找不到它，`usbipd attach` 会直接报：
+
+```
+usbipd: error: Loading vhci_hcd failed; update with 'wsl --update'.
+```
+
+整条 USB 透传就废了。我第一次就是只换了内核没装模块，把老师那套流程的关键一环弄断了。
+
+### 4.4 验证
 
 ```bash
 bash verify.sh
 ```
+
+期望：
+
 ```
-CONFIG_USB_SERIAL_CH341=y
-CONFIG_USB_SERIAL_CP210X=y
-CONFIG_USB_SERIAL_FTDI_SIO=y
-CONFIG_USB_SERIAL_PL2303=y
-  ch341 ✓ 编进内核且已注册
-  cp210x ✓ 编进内核且已注册
-  ftdi_sio ✓ 编进内核且已注册
-  pl2303 ✓ 编进内核且已注册
+CONFIG_USB_SERIAL_PL2303=m
+  ch341   ✓
+  cp210x  ✓
+  ftdi_sio ✓
+  pl2303  ✓
+vhci_hcd  ✓
 ```
 
-## 必须知道的两个副作用
+然后再插线、`usbipd attach`，`ls /dev/ttyUSB*` 就有设备了。
 
-**① 自定义内核启动后，发行版自带的 `/lib/modules` 模块用不了。**
-WSL 只在官方内核下才提供那套模块，换内核后 `/lib/modules/<版本>/` 是空的。
-所以本仓库的脚本**直接把四个串口驱动全部编进内核**（`=y`），谁都不依赖模块。
+## 三个坑
 
-代价：如果你还需要别的模块（docker 的 netfilter、某些文件系统之类），也得自己编进内核，或者切回官方内核。
+**坑 1：只编模块补不进去。**
+WSL 内核开了 `CONFIG_MODVERSIONS=y`，模块要和内核的 `Module.symvers` 对得上，而这个文件只有完整编译内核才有。实测直接编：253 个符号未定义；硬编出来 `insmod` 也会 `disagrees about version of symbol module_layout`。
 
-**② 版本号会多一个 `+`。**
-源码是 git 仓库且工作区有改动时，内核会给版本号加 `+`，变成 `...WSL2+`，那样它就和 `/lib/modules/...WSL2` 对不上。
-`build-kernel.sh` 里已处理（把 `.git` 移开再编译），所以 `uname -r` 和原来完全一致。
+**坑 2：换内核会丢模块，包括 usbipd 的 `vhci_hcd`。**
+所以必须 `install-modules.sh`（`make modules_install` + `depmod`）。
 
+**坑 3：版本号多一个 `+`。**
+源码是 git 仓库且工作区有改动时，内核版本会变成 `...WSL2+`，`/lib/modules/...WSL2` 就对不上，模块全部加载失败。`build-kernel.sh` 里把 `.git` 挪开解决。
 ## 第五步：交叉编译
 
 ```bash
@@ -185,12 +200,22 @@ wsl --shutdown
 | --- | --- |
 | 机器 | Surface Pro X（Microsoft SQ2，Windows 11 ARM64） |
 | WSL | Ubuntu 22.04，内核 6.18.58.1-microsoft-standard-WSL2 |
-| 首次完整编译 | **33 分 25 秒**（`make -j8 Image`，8 核） |
-| 改配置后增量编译 | 约 3 分钟 |
-| 内核镜像 | 38.9 MB |
-| 换内核后验证 | 四个串口驱动已注册；网络 ✓；`/mnt/c` ✓；与 Windows 互操作 ✓；交叉工具链 ✓；`make` ✓ |
-| 回滚验证 | 删 `kernel=` 一行即可恢复 |
+| 完整编译 | **51 分 21 秒**（`make -j8 Image modules`，8 核，4356 个模块） |
+| 内核镜像 | 38.7 MB |
+| 换内核后 | `vhci_hcd` ✓ 能加载；`usbipd attach` ✓ 成功；**`/dev/ttyUSB0` 真的出现了** |
+| 串口实测 | `dmesg` 显示 `ch341-uart converter now attached to ttyUSB0`；`stty -F /dev/ttyUSB0 115200` 成功 |
+| 其它功能 | 网络 ✓、`/mnt/c` ✓、与 Windows 互操作 ✓、交叉工具链 ✓、`make` ✓ |
+| 回滚 | 删掉 `.wslconfig` 里 `kernel=` 一行，`wsl --shutdown`，十秒恢复 |
 
+## 编译进度条
+
+`progress.sh` + `内核编译进度.cmd`：双击后每秒刷新，显示阶段、已用时间、已编译对象数。
+
+```
+[###############-----------------------]  40%  编译中  已用 22分46秒  约剩 33 分  对象 1869
+```
+
+百分比是按总时长估算的（内核不提供真实剩余量），但"阶段"和"对象数"是真实的。
 ## 已知限制
 
 - 没有实物串口线时只能验证"驱动已注册"，不能验证真实收发（本仓库的验证到此为止）。
